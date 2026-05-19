@@ -1,0 +1,41 @@
+{
+  "name": "stack-doctor",
+  "version": "0.1.0",
+  "description": "Static + live analysis of Redis caching and queuing usage in Node.js backends.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "stack-doctor": "./dist/cli/index.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "commander": "^12.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  },
+  "keywords": [
+    "redis",
+    "cache",
+    "queue",
+    "bullmq",
+    "analysis",
+    "cli",
+    "inspector"
+  ],
+  "license": "dhruv-arora"
+}
