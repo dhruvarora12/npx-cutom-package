@@ -6,7 +6,7 @@ import { scanFiles } from '../core/scanner.js';
 import { analyzeCache } from '../core/analyze-cache.js';
 import { analyzeQueue } from '../core/analyze-queue.js';
 import type { CliOptions, DetectionResult } from '../types/index.js';
-import type { CacheAnalysisResult, Finding, QueueAnalysisResult } from '../types/findings.js';
+import type { CacheAnalysisResult, Finding, FindingSeverity, QueueAnalysisResult } from '../types/findings.js';
 import type { ScanResult } from '../types/scan.js';
 
 const program = new Command();
@@ -94,29 +94,120 @@ program
     const scanResult = await scanFiles(targetPath, libNames);
     const cacheResult = options.skipCache ? null : analyzeCache(scanResult);
     const queueResult = options.skipQueues ? null : analyzeQueue(scanResult);
+    const summary = buildReportSummary(cacheResult, queueResult);
 
     if (isAutoMode) {
       const filename = `stack-doctor-report-${date}.md`;
       const filepath = join(resolve(targetPath), filename);
-      const md = buildMarkdownReport(result, scanResult, cacheResult, queueResult, options, date);
+      const md = buildMarkdownReport(result, scanResult, cacheResult, queueResult, summary, options, date);
       await writeFile(filepath, md, 'utf-8');
       const rel = './' + relative(process.cwd(), filepath).replace(/\\/g, '/');
       console.log(`Report saved to ${rel}`);
       return;
     }
 
-    printReport(result, scanResult, cacheResult, queueResult, options, date);
+    printReport(result, scanResult, cacheResult, queueResult, summary, options, date);
   });
 
 program.parse();
 
-// ── Markdown builder (shared by auto-save and --output markdown) ─────────────
+// ── Internal report model ─────────────────────────────────────────────────────
+
+type Grade = 'A' | 'B' | 'C' | 'D' | 'F';
+
+interface FileGroup {
+  path: string;
+  findings: Finding[];
+  worstSeverity: FindingSeverity;
+}
+
+interface ReportSummary {
+  errors: number;
+  warnings: number;
+  filesAffected: number;
+  totalFindings: number;
+}
+
+// ── Grade ─────────────────────────────────────────────────────────────────────
+
+function computeGrade(errors: number, warnings: number): Grade {
+  if (errors >= 6) return 'F';
+  if (errors >= 3) return 'D';
+  if (errors >= 1) return 'C';   // 1–2 errors
+  if (warnings >= 4) return 'C'; // 0 errors, 4+ warnings
+  if (warnings >= 1) return 'B';
+  return 'A';
+}
+
+// ── File groups ───────────────────────────────────────────────────────────────
+
+const SEVERITY_RANK: Record<FindingSeverity, number> = { error: 0, warn: 1, info: 2 };
+
+/**
+ * Groups findings by file path, sorts within each group (errors → warnings → info,
+ * stable), then sorts the groups themselves (error-files first, then warn, then info).
+ * Returns [] when findings is empty — safe to call when both results are null.
+ */
+function buildFileGroups(findings: Finding[]): FileGroup[] {
+  if (findings.length === 0) return [];
+
+  const map = new Map<string, Finding[]>();
+  for (const f of findings) {
+    const existing = map.get(f.file);
+    if (existing !== undefined) {
+      existing.push(f);
+    } else {
+      map.set(f.file, [f]);
+    }
+  }
+
+  const groups: FileGroup[] = [];
+  for (const [path, group] of map) {
+    // Stable sort: Array.sort is stable in V8/Node ≥ 11 — detection order preserved within tier
+    const sorted = [...group].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
+    groups.push({ path, findings: sorted, worstSeverity: sorted[0]!.severity });
+  }
+
+  groups.sort((a, b) => SEVERITY_RANK[a.worstSeverity] - SEVERITY_RANK[b.worstSeverity]);
+  return groups;
+}
+
+// ── Summary ───────────────────────────────────────────────────────────────────
+
+function buildReportSummary(
+  cacheResult: CacheAnalysisResult | null,
+  queueResult: QueueAnalysisResult | null,
+): ReportSummary {
+  const allFindings: Finding[] = [
+    ...(cacheResult?.findings ?? []),
+    ...(queueResult?.findings ?? []),
+  ];
+  const errors = allFindings.filter(f => f.severity === 'error').length;
+  const warnings = allFindings.filter(f => f.severity === 'warn').length;
+  const filesAffected = new Set(allFindings.map(f => f.file)).size;
+  return { errors, warnings, filesAffected, totalFindings: allFindings.length };
+}
+
+function formatGradeLine(summary: ReportSummary): string {
+  const grade = computeGrade(summary.errors, summary.warnings);
+  const parts: string[] = [];
+  if (summary.errors > 0) parts.push(`${summary.errors} error${summary.errors > 1 ? 's' : ''}`);
+  if (summary.warnings > 0) parts.push(`${summary.warnings} warning${summary.warnings > 1 ? 's' : ''}`);
+  if (summary.filesAffected > 0) {
+    parts.push(`${summary.filesAffected} ${summary.filesAffected === 1 ? 'file' : 'files'} affected`);
+  }
+  const detail = parts.length > 0 ? `   ${parts.join(' · ')}` : '';
+  return `Grade: ${grade}${detail}`;
+}
+
+// ── Markdown builder (shared by auto-save and --output markdown) ──────────────
 
 function buildMarkdownReport(
   result: DetectionResult,
   scanResult: ScanResult,
   cacheResult: CacheAnalysisResult | null,
   queueResult: QueueAnalysisResult | null,
+  summary: ReportSummary,
   options: CliOptions,
   date: string,
 ): string {
@@ -128,9 +219,12 @@ function buildMarkdownReport(
     return true;
   });
 
+  // ── Header + grade (grade first per Option A) ──
   lines.push('# Stack Doctor Report', '');
   lines.push(`_Generated: ${date}_`, '');
+  lines.push(formatGradeLine(summary), '');
 
+  // ── Libraries + scan stats ──
   lines.push('## Detected Libraries', '');
   for (const c of clients) {
     lines.push(`- **${c.name}** \`${c.version}\` — ${c.category}`);
@@ -149,37 +243,56 @@ function buildMarkdownReport(
     }
   }
 
-  if (cacheResult !== null) {
-    lines.push('', '## Cache Analysis', '');
-    if (cacheResult.findings.length === 0) {
-      lines.push('No cache issues found.', '');
-      lines.push(`> ${cacheResult.disclaimer}`);
-    } else {
+  // ── Analysis sections ──
+  const cacheRan = cacheResult !== null;
+  const queueRan = queueResult !== null;
+  const cacheHasFindings = cacheRan && cacheResult.findings.length > 0;
+  const queueHasFindings = queueRan && queueResult.findings.length > 0;
+  const bothRanAndClean = cacheRan && queueRan && !cacheHasFindings && !queueHasFindings;
+
+  if (bothRanAndClean) {
+    lines.push('', '## Analysis', '');
+    lines.push('✓ No static issues found. Run with `--live` to check your live Redis instance.');
+  } else {
+    // Cache section
+    if (options.skipCache) {
+      lines.push('', '_Cache analysis skipped (`--skip-cache`). Run without this flag to include it._');
+    } else if (cacheRan && !cacheHasFindings) {
+      lines.push('', '_Cache: no issues found ✓_');
+    } else if (cacheResult !== null) {
+      lines.push('', '## Cache Analysis', '');
       lines.push(formatFindingsSummary(cacheResult.findings, cacheResult.filesAnalyzed), '');
-      for (const f of cacheResult.findings) {
-        lines.push(...formatFindingMarkdown(f));
+      for (const group of buildFileGroups(cacheResult.findings)) {
+        lines.push(`### \`${group.path}\``, '');
+        for (const f of group.findings) lines.push(...formatFindingMarkdown(f));
       }
       lines.push(`> ${cacheResult.disclaimer}`);
     }
-  }
 
-  if (queueResult !== null) {
-    lines.push('', '## Queue Analysis', '');
-    if (queueResult.advisories.length > 0) {
-      for (const a of queueResult.advisories) lines.push(`> ${a}`, '');
-    }
-    if (queueResult.findings.length === 0) {
-      lines.push('No queue issues found.', '');
-      lines.push(`> ${queueResult.disclaimer}`);
-    } else {
+    // Queue section
+    if (options.skipQueues) {
+      lines.push('', '_Queue analysis skipped (`--skip-queues`). Run without this flag to include it._');
+    } else if (queueRan && !queueHasFindings) {
+      lines.push('', '_Queue: no issues found ✓_');
+      if (queueResult!.advisories.length > 0) {
+        lines.push('');
+        for (const a of queueResult!.advisories) lines.push(`> ${a}`);
+      }
+    } else if (queueResult !== null) {
+      lines.push('', '## Queue Analysis', '');
+      if (queueResult.advisories.length > 0) {
+        for (const a of queueResult.advisories) lines.push(`> ${a}`, '');
+      }
       lines.push(formatFindingsSummary(queueResult.findings, queueResult.filesAnalyzed), '');
-      for (const f of queueResult.findings) {
-        lines.push(...formatFindingMarkdown(f));
+      for (const group of buildFileGroups(queueResult.findings)) {
+        lines.push(`### \`${group.path}\``, '');
+        for (const f of group.findings) lines.push(...formatFindingMarkdown(f));
       }
       lines.push(`> ${queueResult.disclaimer}`);
     }
   }
 
+  // ── Warnings + skipped files ──
   if (result.warnings.length > 0) {
     lines.push('', '## Warnings', '');
     for (const w of result.warnings) lines.push(`- ${w}`);
@@ -198,27 +311,6 @@ function buildMarkdownReport(
   return lines.join('\n');
 }
 
-function formatFindingsSummary(findings: Finding[], filesAnalyzed: number): string {
-  const errorCount = findings.filter(f => f.severity === 'error').length;
-  const warnCount = findings.filter(f => f.severity === 'warn').length;
-  const counts = [
-    errorCount > 0 ? `${errorCount} error${errorCount > 1 ? 's' : ''}` : '',
-    warnCount > 0 ? `${warnCount} warning${warnCount > 1 ? 's' : ''}` : '',
-  ].filter(Boolean).join(', ');
-  return `${counts} in ${filesAnalyzed} ${filesAnalyzed === 1 ? 'file' : 'files'} analysed.`;
-}
-
-function formatFindingMarkdown(f: Finding): string[] {
-  const out: string[] = [];
-  out.push(`### ${f.severity.toUpperCase()} — \`${f.rule}\``);
-  out.push(`**${f.file}:${f.line}**  `);
-  out.push(f.message + '  ');
-  if (f.codeSnippet) out.push('```', f.codeSnippet, '```');
-  if (f.fix) out.push(`> Fix: ${f.fix}`);
-  out.push('');
-  return out;
-}
-
 // ── Text / JSON / explicit markdown output ────────────────────────────────────
 
 function printReport(
@@ -226,6 +318,7 @@ function printReport(
   scanResult: ScanResult,
   cacheResult: CacheAnalysisResult | null,
   queueResult: QueueAnalysisResult | null,
+  summary: ReportSummary,
   options: CliOptions,
   date: string,
 ): void {
@@ -239,6 +332,12 @@ function printReport(
     console.log(
       JSON.stringify(
         {
+          summary: {
+            errors: summary.errors,
+            warnings: summary.warnings,
+            filesAffected: summary.filesAffected,
+            totalFindings: summary.totalFindings,
+          },
           clients,
           warnings: result.warnings,
           scanStats: scanResult.stats,
@@ -272,13 +371,14 @@ function printReport(
   }
 
   if (options.output === 'markdown') {
-    console.log(buildMarkdownReport(result, scanResult, cacheResult, queueResult, options, date));
+    console.log(buildMarkdownReport(result, scanResult, cacheResult, queueResult, summary, options, date));
     return;
   }
 
   // ── Text ──────────────────────────────────────────────────────────────────
   console.log('\nStack Doctor — Static Analysis\n');
-  console.log(`Scanned: ${result.packageJsonPath ?? 'unknown'}\n`);
+  console.log(formatGradeLine(summary));
+  console.log(`\nScanned: ${result.packageJsonPath ?? 'unknown'}\n`);
 
   if (clients.length === 0) {
     console.log('No matching libraries found with current --skip-* filters.');
@@ -306,8 +406,43 @@ function printReport(
     }
   }
 
-  if (cacheResult !== null) printCacheFindings(cacheResult);
-  if (queueResult !== null) printQueueFindings(queueResult);
+  // ── Analysis sections ──
+  const cacheRan = cacheResult !== null;
+  const queueRan = queueResult !== null;
+  const cacheHasFindings = cacheRan && cacheResult.findings.length > 0;
+  const queueHasFindings = queueRan && queueResult.findings.length > 0;
+  const bothRanAndClean = cacheRan && queueRan && !cacheHasFindings && !queueHasFindings;
+
+  if (bothRanAndClean) {
+    console.log('\n✓ No static issues found. Run with --live to check your live Redis instance.');
+  } else {
+    // Cache section
+    if (options.skipCache) {
+      console.log('\nCache analysis skipped (--skip-cache). Run without this flag to include it.');
+    } else if (cacheRan && !cacheHasFindings) {
+      console.log('\nCache: no issues found ✓');
+    } else if (cacheResult !== null) {
+      printAnalysisSection('Cache Analysis', cacheResult.findings, cacheResult.filesAnalyzed, cacheResult.disclaimer);
+    }
+
+    // Queue section
+    if (options.skipQueues) {
+      console.log('\nQueue analysis skipped (--skip-queues). Run without this flag to include it.');
+    } else if (queueRan && !queueHasFindings) {
+      console.log('\nQueue: no issues found ✓');
+      if (queueResult!.advisories.length > 0) {
+        for (const a of queueResult!.advisories) console.log(`  ! ${a}`);
+      }
+    } else if (queueResult !== null) {
+      printAnalysisSection(
+        'Queue Analysis',
+        queueResult.findings,
+        queueResult.filesAnalyzed,
+        queueResult.disclaimer,
+        queueResult.advisories,
+      );
+    }
+  }
 
   if (result.warnings.length > 0) {
     console.log('\nWarnings:');
@@ -318,39 +453,31 @@ function printReport(
   console.log('');
 }
 
-function printCacheFindings(cacheResult: CacheAnalysisResult): void {
-  console.log('\nCache Analysis');
-  if (cacheResult.findings.length === 0) {
-    console.log('  No cache issues found.');
-    console.log(`\n  ! ${cacheResult.disclaimer}`);
-    return;
+function printAnalysisSection(
+  title: string,
+  findings: Finding[],
+  filesAnalyzed: number,
+  disclaimer: string,
+  advisories?: string[],
+): void {
+  console.log(`\n${title}`);
+  if (advisories !== undefined && advisories.length > 0) {
+    for (const a of advisories) console.log(`  ! ${a}`);
   }
-  console.log(`\n  ${formatFindingsSummary(cacheResult.findings, cacheResult.filesAnalyzed)}\n`);
-  for (const f of cacheResult.findings) printFinding(f);
-  console.log(`\n  ! ${cacheResult.disclaimer}`);
-}
-
-function printQueueFindings(queueResult: QueueAnalysisResult): void {
-  console.log('\nQueue Analysis');
-  if (queueResult.advisories.length > 0) {
-    for (const a of queueResult.advisories) console.log(`  ! ${a}`);
+  console.log(`\n  ${formatFindingsSummary(findings, filesAnalyzed)}\n`);
+  for (const group of buildFileGroups(findings)) {
+    console.log(`  ${group.path}`);
+    for (const f of group.findings) printFinding(f);
   }
-  if (queueResult.findings.length === 0) {
-    console.log('  No queue issues found.');
-    console.log(`\n  ! ${queueResult.disclaimer}`);
-    return;
-  }
-  console.log(`\n  ${formatFindingsSummary(queueResult.findings, queueResult.filesAnalyzed)}\n`);
-  for (const f of queueResult.findings) printFinding(f);
-  console.log(`\n  ! ${queueResult.disclaimer}`);
+  console.log(`\n  ! ${disclaimer}`);
 }
 
 function printFinding(f: Finding): void {
   const sevLabel = f.severity === 'error' ? 'ERROR' : f.severity === 'warn' ? 'WARN ' : 'INFO ';
-  console.log(`  ${sevLabel}  ${f.rule.padEnd(28)}  ${f.file}:${f.line}`);
-  if (f.codeSnippet) console.log(`    ${f.codeSnippet}`);
-  console.log(`    ${f.message}`);
-  if (f.fix) console.log(`    Fix: ${f.fix}`);
+  console.log(`    ${sevLabel}  ${f.rule.padEnd(28)}  ${f.file}:${f.line}`);
+  if (f.codeSnippet) console.log(`      ${f.codeSnippet}`);
+  console.log(`      ${f.message}`);
+  if (f.fix) console.log(`      Fix: ${f.fix}`);
   console.log('');
 }
 
@@ -358,6 +485,27 @@ function formatScanSummary(scanResult: ScanResult): string {
   const total = scanResult.allParsedCount;
   const withImports = scanResult.files.length;
   return `Scanned ${total} ${total === 1 ? 'file' : 'files'} — found Redis/queue imports in ${withImports} ${withImports === 1 ? 'file' : 'files'}.`;
+}
+
+function formatFindingsSummary(findings: Finding[], filesAnalyzed: number): string {
+  const errorCount = findings.filter(f => f.severity === 'error').length;
+  const warnCount = findings.filter(f => f.severity === 'warn').length;
+  const counts = [
+    errorCount > 0 ? `${errorCount} error${errorCount > 1 ? 's' : ''}` : '',
+    warnCount > 0 ? `${warnCount} warning${warnCount > 1 ? 's' : ''}` : '',
+  ].filter(Boolean).join(', ');
+  return `${counts} in ${filesAnalyzed} ${filesAnalyzed === 1 ? 'file' : 'files'} analysed.`;
+}
+
+function formatFindingMarkdown(f: Finding): string[] {
+  const out: string[] = [];
+  out.push(`#### ${f.severity.toUpperCase()} — \`${f.rule}\``);
+  out.push(`**${f.file}:${f.line}**  `);
+  out.push(f.message + '  ');
+  if (f.codeSnippet) out.push('```', f.codeSnippet, '```');
+  if (f.fix) out.push(`> Fix: ${f.fix}`);
+  out.push('');
+  return out;
 }
 
 function printSkippedSummary(scanResult: ScanResult, options: CliOptions): void {
