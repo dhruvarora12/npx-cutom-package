@@ -5,9 +5,11 @@ import { detectProject } from '../core/detect.js';
 import { scanFiles } from '../core/scanner.js';
 import { analyzeCache } from '../core/analyze-cache.js';
 import { analyzeQueue } from '../core/analyze-queue.js';
+import { analyzeLive } from '../core/live-redis.js';
 import type { CliOptions, DetectionResult } from '../types/index.js';
 import type { CacheAnalysisResult, Finding, FindingSeverity, QueueAnalysisResult } from '../types/findings.js';
 import type { ScanResult } from '../types/scan.js';
+import type { LiveRedisResult } from '../types/live.js';
 
 const program = new Command();
 
@@ -28,19 +30,26 @@ program
   .option('--no-color', 'Disable colored output')
   .option('--skip-cache', 'Skip cache analysis', false)
   .option('--skip-queues', 'Skip queue analysis', false)
-  .option('--live', 'Run live Redis inspection (Phase 6+)', false)
+  .option('--live', 'Run live Redis inspection', false)
   .option('--redis-url <url>', 'Redis connection URL (requires --live)')
+  .option('-y, --yes', 'Skip safety countdown for CI use', false)
   .option('--env-file <path>', 'Read Redis URL from .env file (requires --live)', '.env')
   .option('--sample-size <n>', 'Keys to sample in live mode (default: 1000)', '1000')
   .option('--idle-threshold <days>', 'Days before a key is considered idle (default: 30)', '30')
   .action(async (targetPath: string, rawOpts: Record<string, unknown>) => {
-    if (rawOpts['skipCache'] === true && rawOpts['skipQueues'] === true) {
+    // --skip-cache + --skip-queues is only an error when --live is not set
+    if (rawOpts['skipCache'] === true && rawOpts['skipQueues'] === true && rawOpts['live'] !== true) {
       console.error('Error: --skip-cache and --skip-queues together leave nothing to analyze.');
       process.exit(1);
     }
 
     if (rawOpts['redisUrl'] !== undefined && rawOpts['live'] !== true) {
       console.error('Error: --redis-url requires --live.');
+      process.exit(1);
+    }
+
+    if (rawOpts['live'] === true && rawOpts['redisUrl'] === undefined) {
+      console.error('Error: --live requires --redis-url <url>.');
       process.exit(1);
     }
 
@@ -71,18 +80,15 @@ program
       process.exit(0);
     }
 
-    if (!result.hasRedis && !result.hasQueues) {
+    // Allow --live to proceed even when no static Redis usage is found
+    if (!result.hasRedis && !result.hasQueues && !options.live) {
       console.log(
         'No Redis usage found in code. Use --live --redis-url <url> to inspect a Redis instance directly.',
       );
       process.exit(0);
     }
 
-    if (options.live) {
-      console.log('[Phase 6 — live mode not yet implemented]');
-      process.exit(0);
-    }
-
+    // Static analysis (libNames may be empty if all filtered or no clients found)
     const libNames = result.clients
       .filter(c => {
         if (options.skipCache && c.category === 'redis-client') return false;
@@ -96,20 +102,55 @@ program
     const queueResult = options.skipQueues ? null : analyzeQueue(scanResult);
     const summary = buildReportSummary(cacheResult, queueResult);
 
+    // Live analysis — runs after static, outputs together
+    let liveResult: LiveRedisResult | null = null;
+    if (options.live) {
+      const skipCountdown = rawOpts['yes'] as boolean;
+      await runCountdown(options.redisUrl!, skipCountdown);
+      try {
+        liveResult = await analyzeLive(options.redisUrl!);
+      } catch (err) {
+        console.error(`\nError: Could not connect to Redis at ${options.redisUrl!}`);
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+    }
+
     if (isAutoMode) {
       const filename = `stack-doctor-report-${date}.md`;
       const filepath = join(resolve(targetPath), filename);
-      const md = buildMarkdownReport(result, scanResult, cacheResult, queueResult, summary, options, date);
+      const md = buildMarkdownReport(result, scanResult, cacheResult, queueResult, liveResult, summary, options, date);
       await writeFile(filepath, md, 'utf-8');
       const rel = './' + relative(process.cwd(), filepath).replace(/\\/g, '/');
       console.log(`Report saved to ${rel}`);
       return;
     }
 
-    printReport(result, scanResult, cacheResult, queueResult, summary, options, date);
+    printReport(result, scanResult, cacheResult, queueResult, liveResult, summary, options, date);
   });
 
 program.parse();
+
+// ── Countdown helpers ─────────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(res => setTimeout(res, ms));
+}
+
+async function runCountdown(url: string, skipCountdown: boolean): Promise<void> {
+  process.stdout.write(`\nConnecting to ${url} (read-only inspection).\n`);
+  process.stdout.write('This tool will not modify any data. Press Ctrl+C to cancel.\n');
+  if (skipCountdown) {
+    process.stdout.write('Proceeding...\n\n');
+    return;
+  }
+  process.stdout.write('Proceeding in 3 seconds...\n');
+  for (let i = 3; i >= 1; i--) {
+    process.stdout.write(`\r${i}...`);
+    await sleep(1000);
+  }
+  process.stdout.write('\r      \n\n');
+}
 
 // ── Internal report model ─────────────────────────────────────────────────────
 
@@ -163,7 +204,6 @@ function buildFileGroups(findings: Finding[]): FileGroup[] {
 
   const groups: FileGroup[] = [];
   for (const [path, group] of map) {
-    // Stable sort: Array.sort is stable in V8/Node ≥ 11 — detection order preserved within tier
     const sorted = [...group].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
     groups.push({ path, findings: sorted, worstSeverity: sorted[0]!.severity });
   }
@@ -200,6 +240,31 @@ function formatGradeLine(summary: ReportSummary): string {
   return `Grade: ${grade}${detail}`;
 }
 
+// ── Live section helpers ──────────────────────────────────────────────────────
+
+function formatUptime(seconds: number): string {
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function buildLiveMemoryLine(live: LiveRedisResult): string {
+  return live.memory.maxBytes > 0
+    ? `${live.memory.usedHuman} / ${live.memory.maxHuman} (${live.memory.usagePercent.toFixed(1)}%)`
+    : `${live.memory.usedHuman} / no limit`;
+}
+
+function buildLiveKeyLine(live: LiveRedisResult): string {
+  const total = live.keyspace.totalKeys.toLocaleString();
+  if (live.keyspace.totalKeys === 0) return `${total} total`;
+  const withTtl = live.keyspace.keysWithTtl.toLocaleString();
+  const withoutTtl = live.keyspace.keysWithoutTtl.toLocaleString();
+  return `${total} total  (${withTtl} with TTL · ${withoutTtl} without)`;
+}
+
 // ── Markdown builder (shared by auto-save and --output markdown) ──────────────
 
 function buildMarkdownReport(
@@ -207,6 +272,7 @@ function buildMarkdownReport(
   scanResult: ScanResult,
   cacheResult: CacheAnalysisResult | null,
   queueResult: QueueAnalysisResult | null,
+  liveResult: LiveRedisResult | null,
   summary: ReportSummary,
   options: CliOptions,
   date: string,
@@ -243,7 +309,7 @@ function buildMarkdownReport(
     }
   }
 
-  // ── Analysis sections ──
+  // ── Static analysis sections ──
   const cacheRan = cacheResult !== null;
   const queueRan = queueResult !== null;
   const cacheHasFindings = cacheRan && cacheResult.findings.length > 0;
@@ -276,7 +342,7 @@ function buildMarkdownReport(
       lines.push('', '_Queue: no issues found ✓_');
       if (queueResult!.advisories.length > 0) {
         lines.push('');
-        for (const a of queueResult!.advisories) lines.push(`> ${a}`);
+        for (const a of queueResult!.advisories) lines.push(`> ${a}`, '');
       }
     } else if (queueResult !== null) {
       lines.push('', '## Queue Analysis', '');
@@ -290,6 +356,11 @@ function buildMarkdownReport(
       }
       lines.push(`> ${queueResult.disclaimer}`);
     }
+  }
+
+  // ── Live section (after static, per Bucket 6a) ──
+  if (liveResult !== null) {
+    lines.push(...buildLiveMarkdownLines(liveResult));
   }
 
   // ── Warnings + skipped files ──
@@ -311,6 +382,34 @@ function buildMarkdownReport(
   return lines.join('\n');
 }
 
+function buildLiveMarkdownLines(live: LiveRedisResult): string[] {
+  const lines: string[] = [];
+  const hitInfo =
+    live.cacheHitRate !== null
+      ? `${live.cacheHitRate.toFixed(1)}%`
+      : 'n/a (no requests yet)';
+
+  lines.push('', '## Live Redis Health', '');
+  lines.push(
+    `_Redis ${live.redisVersion}  ·  uptime ${formatUptime(live.uptimeSeconds)}  ·  ${live.connectedClients} connected ${live.connectedClients === 1 ? 'client' : 'clients'}_`,
+    '',
+  );
+  lines.push('| Metric | Value |');
+  lines.push('|--------|-------|');
+  lines.push(`| Memory | ${buildLiveMemoryLine(live)} |`);
+  lines.push(`| Keys | ${buildLiveKeyLine(live)} |`);
+  lines.push(`| Hit rate | ${hitInfo} |`);
+  lines.push(`| Eviction | ${live.memory.evictionPolicy} |`);
+  lines.push(`| Frag. ratio | ${live.memory.fragmentationRatio.toFixed(2)} |`);
+
+  if (live.warnings.length > 0) {
+    lines.push('');
+    for (const w of live.warnings) lines.push(`> ! ${w}`);
+  }
+
+  return lines;
+}
+
 // ── Text / JSON / explicit markdown output ────────────────────────────────────
 
 function printReport(
@@ -318,6 +417,7 @@ function printReport(
   scanResult: ScanResult,
   cacheResult: CacheAnalysisResult | null,
   queueResult: QueueAnalysisResult | null,
+  liveResult: LiveRedisResult | null,
   summary: ReportSummary,
   options: CliOptions,
   date: string,
@@ -362,6 +462,20 @@ function printReport(
                 },
               }
             : {}),
+          ...(liveResult !== null
+            ? {
+                liveAnalysis: {
+                  host: liveResult.host,
+                  redisVersion: liveResult.redisVersion,
+                  uptimeSeconds: liveResult.uptimeSeconds,
+                  connectedClients: liveResult.connectedClients,
+                  memory: liveResult.memory,
+                  keyspace: liveResult.keyspace,
+                  cacheHitRate: liveResult.cacheHitRate,
+                  warnings: liveResult.warnings,
+                },
+              }
+            : {}),
         },
         null,
         2,
@@ -371,7 +485,7 @@ function printReport(
   }
 
   if (options.output === 'markdown') {
-    console.log(buildMarkdownReport(result, scanResult, cacheResult, queueResult, summary, options, date));
+    console.log(buildMarkdownReport(result, scanResult, cacheResult, queueResult, liveResult, summary, options, date));
     return;
   }
 
@@ -382,6 +496,7 @@ function printReport(
 
   if (clients.length === 0) {
     console.log('No matching libraries found with current --skip-* filters.');
+    if (liveResult !== null) printLiveSection(liveResult);
     return;
   }
 
@@ -406,7 +521,7 @@ function printReport(
     }
   }
 
-  // ── Analysis sections ──
+  // ── Static analysis sections ──
   const cacheRan = cacheResult !== null;
   const queueRan = queueResult !== null;
   const cacheHasFindings = cacheRan && cacheResult.findings.length > 0;
@@ -444,12 +559,49 @@ function printReport(
     }
   }
 
+  // ── Live section (after static, per Bucket 6a) ──
+  if (liveResult !== null) {
+    printLiveSection(liveResult);
+  }
+
   if (result.warnings.length > 0) {
     console.log('\nWarnings:');
     for (const w of result.warnings) console.log(`  ! ${w}`);
   }
 
   printSkippedSummary(scanResult, options);
+  console.log('');
+}
+
+function printLiveSection(live: LiveRedisResult): void {
+  console.log('\nLive Redis Health\n');
+  console.log(
+    `  Redis ${live.redisVersion}  ·  uptime ${formatUptime(live.uptimeSeconds)}  ·  ${live.connectedClients} connected ${live.connectedClients === 1 ? 'client' : 'clients'}`,
+  );
+  console.log('');
+
+  const hitInfo =
+    live.cacheHitRate !== null
+      ? `${live.cacheHitRate.toFixed(1)}%`
+      : 'n/a (no requests yet)';
+
+  const rows: Array<[string, string]> = [
+    ['Memory', buildLiveMemoryLine(live)],
+    ['Keys', buildLiveKeyLine(live)],
+    ['Hit rate', hitInfo],
+    ['Eviction', live.memory.evictionPolicy],
+    ['Frag. ratio', live.memory.fragmentationRatio.toFixed(2)],
+  ];
+
+  const labelWidth = Math.max(...rows.map(([label]) => label.length));
+  for (const [label, value] of rows) {
+    console.log(`  ${label.padEnd(labelWidth)}  ${value}`);
+  }
+
+  if (live.warnings.length > 0) {
+    console.log('');
+    for (const w of live.warnings) console.log(`  ! ${w}`);
+  }
   console.log('');
 }
 

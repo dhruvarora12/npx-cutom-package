@@ -31,6 +31,7 @@ stack-doctor [path]
   --skip-queues
   --live                                (Phase 6+)
   --redis-url <url>                     (Phase 6+, requires --live)
+  -y, --yes                             (Phase 6+, skip safety countdown for CI)
   --env-file <path>                     (Phase 6+, default: .env)
   --sample-size <n>                     (Phase 8+, default: 1000)
   --idle-threshold <days>               (Phase 9+, default: 30)
