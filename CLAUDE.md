@@ -12,18 +12,19 @@ anti-patterns, health, capacity, dead data, and concrete recommendations. Publis
   Broader caching techniques (Memcached, in-memory, framework caches) deferred to v2.
 - **Build tool:** tsup, ESM only, Node ≥ 20
 - **CLI parser:** commander v12 (0 transitive deps)
-- **Runtime deps:** commander only
+- **Runtime deps:** commander only (Phase 1); `fdir`, `ignore`, `@babel/parser` added in Phase 2
 - **Two modes:** static (default) + live (`--live`, Phase 6+)
 - **Live mode is read-only:** `SCAN` not `KEYS *`, no mutating commands ever,
   confirmation banner before connecting, 5s connection timeout
 - **Detection strategy Phase 1:** `package.json` scan only. AST/import-level in Phase 3.
+- **Detection strategy Phase 2:** File walker (fdir + .gitignore via ignore) + Babel AST parser. Scans `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`. Extracts import records (ESM + CJS + dynamic) for known libraries only. ASTs cached in `ScanResult` for Phase 3.
 - **Monorepo:** shallow (root `package.json` only) for v1
 
 ## v1 CLI interface (established in Phase 1, no breaking changes after this)
 
 ```
 stack-doctor [path]
-  -o, --output <text|json|markdown>     (default: text)
+  -o, --output <text|json|markdown>     (default: saves stack-doctor-report-YYYY-MM-DD.md in target directory)
   -v, --verbose
   --no-color
   --skip-cache
@@ -40,6 +41,32 @@ stack-doctor [path]
 Memcached, in-memory caches (lru-cache, node-cache), framework caches
 (NestJS CacheModule, Next.js), HTTP/CDN cache headers, RabbitMQ, Kafka,
 AWS SQS, library-API-based queue inspection.
+
+Vue/Svelte component files (`.vue`, `.svelte`) — requires script-block extraction
+pre-processing before AST parsing.
+
+Symlink following during file walk (`--follow-symlinks` flag) — risk of cycles in monorepos.
+
+Re-export tracking (`export { default } from 'lib'`) — deferred to Phase 3.
+
+Variable flow / alias tracking beyond one level (clients passed as function args,
+stored in class properties, returned from helpers) — deferred indefinitely; too
+complex for the static analysis value delivered.
+
+Cache stampede risk detection (GET → miss → SET without mutex) — deferred to Phase 5;
+requires control-flow analysis across multiple statements.
+
+Hard-coded Redis key literals — deferred to Phase 5 / v2; high false-positive rate
+without understanding key namespacing conventions.
+
+Missing error handling on Redis calls — deferred to Phase 5 / v2; requires
+understanding of the surrounding try/catch scope.
+
+`// stack-doctor: ignore` inline comment suppression — deferred to Phase 11 (CI/CD);
+requires reading `leadingComments`/`trailingComments` from Babel AST nodes.
+
+Variable tracing for TTL values beyond one level (Level 3 analysis) — deferred
+indefinitely; complexity outweighs benefit given Level 2 covers real-world cases.
 
 ## Collaboration rules
 
