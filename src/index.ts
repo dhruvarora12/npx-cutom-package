@@ -1,7 +1,7 @@
 export type { DetectionResult, DetectedClient, ClientCategory, CliOptions } from './types/index.js';
 export type { ImportStyle, ImportRecord, SkippedFile, ScannedFile, ScanStats, ScanResult } from './types/scan.js';
 export type { FindingSeverity, FindingRule, Finding, CacheAnalysisResult, QueueAnalysisResult } from './types/findings.js';
-export type { LiveRedisResult } from './types/live.js';
+export type { LiveRedisResult, ScannedKey, NamespaceEntry, KeyScanResult, QueueScanEntry, QueueScanResult } from './types/live.js';
 export { detectProject } from './core/detect.js';
 export { scanFiles, getAst } from './core/scanner.js';
 export { analyzeCache } from './core/analyze-cache.js';

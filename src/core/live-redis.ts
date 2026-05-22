@@ -1,5 +1,7 @@
 import { Redis } from 'ioredis';
 import type { LiveRedisResult } from '../types/live.js';
+import { scanKeys } from './scan-keys.js';
+import { scanQueues } from './scan-queues.js';
 
 const CONNECTION_TIMEOUT_MS = 5000;
 
@@ -92,7 +94,9 @@ function computeCacheHitRate(
   return Math.round((hits / total) * 100 * 100) / 100; // 2 decimal places
 }
 
-function buildWarnings(result: Omit<LiveRedisResult, 'warnings'>): string[] {
+function buildWarnings(
+  result: Omit<LiveRedisResult, 'warnings' | 'keyScan' | 'queueScan'>,
+): string[] {
   const w: string[] = [];
 
   if (result.memory.maxBytes === 0) {
@@ -111,7 +115,7 @@ function buildWarnings(result: Omit<LiveRedisResult, 'warnings'>): string[] {
 
   if (result.cacheHitRate !== null && result.cacheHitRate < 50) {
     w.push(
-      `Low cache hit rate: ${result.cacheHitRate.toFixed(1)}% (expected ≥ 50%)`,
+      `Low cache hit rate: ${result.cacheHitRate.toFixed(1)}% (expected >= 50%)`,
     );
   }
 
@@ -131,7 +135,18 @@ function buildWarnings(result: Omit<LiveRedisResult, 'warnings'>): string[] {
 // Public API
 // ---------------------------------------------------------------------------
 
-export async function analyzeLive(redisUrl: string): Promise<LiveRedisResult> {
+export async function analyzeLive(
+  redisUrl: string,
+  options?: {
+    sampleSize?: number;
+    idleThresholdDays?: number;
+    skipQueues?: boolean;
+    onProgress?: (scanned: number, total: number) => void;
+  },
+): Promise<LiveRedisResult> {
+  const sampleSize = options?.sampleSize ?? 1000;
+  const idleThresholdDays = options?.idleThresholdDays ?? 30;
+
   const client = new Redis(redisUrl, {
     connectTimeout: CONNECTION_TIMEOUT_MS,
     maxRetriesPerRequest: 0,
@@ -200,7 +215,7 @@ export async function analyzeLive(redisUrl: string): Promise<LiveRedisResult> {
       10,
     );
 
-    const partial: Omit<LiveRedisResult, 'warnings'> = {
+    const partial: Omit<LiveRedisResult, 'warnings' | 'keyScan' | 'queueScan'> = {
       connected: true,
       host: redisUrl,
       redisVersion: serverInfo['redis_version'] ?? 'unknown',
@@ -221,7 +236,18 @@ export async function analyzeLive(redisUrl: string): Promise<LiveRedisResult> {
 
     const warnings = [...buildWarnings(partial), ...configWarnings];
 
-    return { ...partial, warnings };
+    // --- queue scan (skip if --skip-queues) ---
+    const queueScan: LiveRedisResult['queueScan'] = options?.skipQueues
+      ? null
+      : await scanQueues(client);
+
+    // --- key scan (only if Redis has keys) ---
+    const keyScan: LiveRedisResult['keyScan'] =
+      keyspace.totalKeys > 0
+        ? await scanKeys(client, sampleSize, idleThresholdDays, options?.onProgress)
+        : null;
+
+    return { ...partial, warnings, queueScan, keyScan };
   } finally {
     await client.quit().catch(() => {
       // ignore quit errors — connection may already be closed

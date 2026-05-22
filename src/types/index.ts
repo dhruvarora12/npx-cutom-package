@@ -2,7 +2,7 @@ export type ClientCategory = 'redis-client' | 'redis-queue';
 
 export type { ImportStyle, ImportRecord, SkippedFile, ScannedFile, ScanStats, ScanResult } from './scan.js';
 export type { FindingSeverity, FindingRule, Finding, CacheAnalysisResult, QueueAnalysisResult } from './findings.js';
-export type { LiveRedisResult } from './live.js';
+export type { LiveRedisResult, ScannedKey, NamespaceEntry, KeyScanResult, QueueScanEntry, QueueScanResult } from './live.js';
 
 export interface DetectedClient {
   name: string;

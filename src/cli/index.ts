@@ -9,7 +9,7 @@ import { analyzeLive } from '../core/live-redis.js';
 import type { CliOptions, DetectionResult } from '../types/index.js';
 import type { CacheAnalysisResult, Finding, FindingSeverity, QueueAnalysisResult } from '../types/findings.js';
 import type { ScanResult } from '../types/scan.js';
-import type { LiveRedisResult } from '../types/live.js';
+import type { KeyScanResult, LiveRedisResult, QueueScanResult } from '../types/live.js';
 
 const program = new Command();
 
@@ -107,12 +107,30 @@ program
     if (options.live) {
       const skipCountdown = rawOpts['yes'] as boolean;
       await runCountdown(options.redisUrl!, skipCountdown);
+
+      // Show progress counter only when output won't be corrupted by \r writes
+      const showProgress = options.output !== 'json' && options.output !== 'markdown';
+
       try {
-        liveResult = await analyzeLive(options.redisUrl!);
+        liveResult = await analyzeLive(options.redisUrl!, {
+          sampleSize: options.sampleSize,
+          idleThresholdDays: options.idleThreshold,
+          skipQueues: options.skipQueues,
+          onProgress: showProgress
+            ? (scanned, total) => {
+                process.stdout.write(`\rScanning keys... ${scanned}/${total}`);
+              }
+            : undefined,
+        });
       } catch (err) {
         console.error(`\nError: Could not connect to Redis at ${options.redisUrl!}`);
         console.error(err instanceof Error ? err.message : String(err));
         process.exit(1);
+      }
+
+      // Clear progress line after scan completes
+      if (showProgress) {
+        process.stdout.write('\r' + ' '.repeat(40) + '\r');
       }
     }
 
@@ -138,18 +156,18 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function runCountdown(url: string, skipCountdown: boolean): Promise<void> {
-  process.stdout.write(`\nConnecting to ${url} (read-only inspection).\n`);
-  process.stdout.write('This tool will not modify any data. Press Ctrl+C to cancel.\n');
+  process.stderr.write(`\nConnecting to ${url} (read-only inspection).\n`);
+  process.stderr.write('This tool will not modify any data. Press Ctrl+C to cancel.\n');
   if (skipCountdown) {
-    process.stdout.write('Proceeding...\n\n');
+    process.stderr.write('Proceeding...\n\n');
     return;
   }
-  process.stdout.write('Proceeding in 3 seconds...\n');
+  process.stderr.write('Proceeding in 3 seconds...\n');
   for (let i = 3; i >= 1; i--) {
-    process.stdout.write(`\r${i}...`);
+    process.stderr.write(`\r${i}...`);
     await sleep(1000);
   }
-  process.stdout.write('\r      \n\n');
+  process.stderr.write('\r      \n\n');
 }
 
 // ── Internal report model ─────────────────────────────────────────────────────
@@ -240,7 +258,7 @@ function formatGradeLine(summary: ReportSummary): string {
   return `Grade: ${grade}${detail}`;
 }
 
-// ── Live section helpers ──────────────────────────────────────────────────────
+// ── Live section formatting helpers ──────────────────────────────────────────
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -249,6 +267,31 @@ function formatUptime(seconds: number): string {
   if (d > 0) return `${d}d ${h}h`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+function formatIdleTime(seconds: number): string {
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d > 0) return `${d}d`;
+  if (h > 0) return `${h}h`;
+  return `${m}m`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
+  if (bytes >= 1_024) return `${(bytes / 1_024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function formatTtl(ttl: number): string {
+  if (ttl === -1) return 'none';
+  if (ttl === -2) return 'expired';
+  return `${ttl}s`;
+}
+
+function truncateKey(key: string, maxLen = 45): string {
+  return key.length <= maxLen ? key : key.slice(0, maxLen - 1) + '…';
 }
 
 function buildLiveMemoryLine(live: LiveRedisResult): string {
@@ -360,7 +403,7 @@ function buildMarkdownReport(
 
   // ── Live section (after static, per Bucket 6a) ──
   if (liveResult !== null) {
-    lines.push(...buildLiveMarkdownLines(liveResult));
+    lines.push(...buildLiveMarkdownLines(liveResult, options.idleThreshold));
   }
 
   // ── Warnings + skipped files ──
@@ -382,7 +425,7 @@ function buildMarkdownReport(
   return lines.join('\n');
 }
 
-function buildLiveMarkdownLines(live: LiveRedisResult): string[] {
+function buildLiveMarkdownLines(live: LiveRedisResult, idleThresholdDays: number): string[] {
   const lines: string[] = [];
   const hitInfo =
     live.cacheHitRate !== null
@@ -405,6 +448,66 @@ function buildLiveMarkdownLines(live: LiveRedisResult): string[] {
   if (live.warnings.length > 0) {
     lines.push('');
     for (const w of live.warnings) lines.push(`> ! ${w}`);
+  }
+
+  lines.push(...buildQueueScanMarkdownLines(live.queueScan));
+  lines.push(...buildKeyScanMarkdownLines(live.keyScan, idleThresholdDays));
+
+  return lines;
+}
+
+function buildKeyScanMarkdownLines(
+  ks: KeyScanResult | null,
+  idleThresholdDays: number,
+): string[] {
+  const lines: string[] = [];
+
+  if (ks === null) {
+    lines.push('', '### Key Analysis', '');
+    lines.push('No keys found in keyspace — nothing to scan.');
+    return lines;
+  }
+
+  lines.push('', `### Key Analysis _(${ks.scanned.toLocaleString()} keys sampled)_`, '');
+  lines.push('| Metric | Value |');
+  lines.push('|--------|-------|');
+  lines.push(`| Keys with no TTL | ${ks.noTtlCount.toLocaleString()} of ${ks.scanned.toLocaleString()} (${ks.noTtlPercent.toFixed(1)}%) |`);
+  lines.push(`| Idle keys | ${ks.idleKeys.length} (idle > ${idleThresholdDays}d) |`);
+  lines.push(`| Oversized keys | ${ks.oversizedKeys.length} (> 512 KB) |`);
+
+  if (ks.idleKeys.length > 0) {
+    lines.push('', '**Top idle keys**', '');
+    lines.push('| Key | Idle | TTL | Memory |');
+    lines.push('|-----|------|-----|--------|');
+    for (const k of ks.idleKeys) {
+      lines.push(`| \`${k.key}\` | ${formatIdleTime(k.idleSeconds)} | ${formatTtl(k.ttl)} | ${formatBytes(k.memoryBytes)} |`);
+    }
+  }
+
+  if (ks.oversizedKeys.length > 0) {
+    lines.push('', '**Top oversized keys**', '');
+    lines.push('| Key | Memory | TTL | Idle |');
+    lines.push('|-----|--------|-----|------|');
+    for (const k of ks.oversizedKeys) {
+      lines.push(`| \`${k.key}\` | ${formatBytes(k.memoryBytes)} | ${formatTtl(k.ttl)} | ${formatIdleTime(k.idleSeconds)} |`);
+    }
+  }
+
+  const hasNamespaces = ks.namespaces.some(n => n.prefix !== '(no prefix)');
+  if (hasNamespaces) {
+    lines.push('', '**Namespace breakdown**', '');
+    lines.push('| Prefix | Keys | Memory | % of total |');
+    lines.push('|--------|------|--------|------------|');
+    for (const ns of ks.namespaces) {
+      lines.push(`| \`${ns.prefix}\` | ${ns.keyCount.toLocaleString()} | ${formatBytes(ns.memoryBytes)} | ${ns.memoryPercent.toFixed(1)}% |`);
+    }
+  } else {
+    lines.push('', 'No namespace patterns detected.');
+  }
+
+  if (ks.warnings.length > 0) {
+    lines.push('');
+    for (const w of ks.warnings) lines.push(`> ! ${w}`);
   }
 
   return lines;
@@ -473,6 +576,8 @@ function printReport(
                   keyspace: liveResult.keyspace,
                   cacheHitRate: liveResult.cacheHitRate,
                   warnings: liveResult.warnings,
+                  queueScan: liveResult.queueScan,
+                  keyScan: liveResult.keyScan,
                 },
               }
             : {}),
@@ -496,7 +601,7 @@ function printReport(
 
   if (clients.length === 0) {
     console.log('No matching libraries found with current --skip-* filters.');
-    if (liveResult !== null) printLiveSection(liveResult);
+    if (liveResult !== null) printLiveSection(liveResult, options.idleThreshold);
     return;
   }
 
@@ -561,7 +666,7 @@ function printReport(
 
   // ── Live section (after static, per Bucket 6a) ──
   if (liveResult !== null) {
-    printLiveSection(liveResult);
+    printLiveSection(liveResult, options.idleThreshold);
   }
 
   if (result.warnings.length > 0) {
@@ -573,7 +678,7 @@ function printReport(
   console.log('');
 }
 
-function printLiveSection(live: LiveRedisResult): void {
+function printLiveSection(live: LiveRedisResult, idleThresholdDays: number): void {
   console.log('\nLive Redis Health\n');
   console.log(
     `  Redis ${live.redisVersion}  ·  uptime ${formatUptime(live.uptimeSeconds)}  ·  ${live.connectedClients} connected ${live.connectedClients === 1 ? 'client' : 'clients'}`,
@@ -602,7 +707,138 @@ function printLiveSection(live: LiveRedisResult): void {
     console.log('');
     for (const w of live.warnings) console.log(`  ! ${w}`);
   }
+
+  // Queue Scan sub-section (before Key Analysis, per Bucket 5)
+  if (live.queueScan !== null) {
+    printQueueScanSection(live.queueScan);
+  }
+
+  // Key Analysis sub-section
+  if (live.keyScan !== null) {
+    printKeyScanSection(live.keyScan, idleThresholdDays);
+  } else {
+    console.log('\n  Key Analysis\n');
+    console.log('  No keys found in keyspace — nothing to scan.');
+    console.log('');
+  }
+}
+
+function printKeyScanSection(ks: KeyScanResult, idleThresholdDays: number): void {
+  console.log(`\n  Key Analysis  (${ks.scanned.toLocaleString()} keys sampled)\n`);
+  console.log(`  No-TTL     ${ks.noTtlCount.toLocaleString()} of ${ks.scanned.toLocaleString()} (${ks.noTtlPercent.toFixed(1)}%)`);
+  console.log(`  Idle       ${ks.idleKeys.length} ${ks.idleKeys.length === 1 ? 'key' : 'keys'}  (idle > ${idleThresholdDays}d)`);
+  console.log(`  Oversized  ${ks.oversizedKeys.length} ${ks.oversizedKeys.length === 1 ? 'key' : 'keys'}  (> 512 KB)`);
+
+  if (ks.idleKeys.length > 0) {
+    console.log('\n  Top idle keys:');
+    for (const k of ks.idleKeys) {
+      const keyCol = truncateKey(k.key).padEnd(46);
+      const idleCol = ('idle ' + formatIdleTime(k.idleSeconds)).padEnd(10);
+      const ttlCol  = ('TTL ' + formatTtl(k.ttl)).padEnd(12);
+      console.log(`    ${keyCol}  ${idleCol}  ${ttlCol}  ${formatBytes(k.memoryBytes)}`);
+    }
+  }
+
+  if (ks.oversizedKeys.length > 0) {
+    console.log('\n  Top oversized keys:');
+    for (const k of ks.oversizedKeys) {
+      const keyCol  = truncateKey(k.key).padEnd(46);
+      const memCol  = formatBytes(k.memoryBytes).padEnd(10);
+      const ttlCol  = ('TTL ' + formatTtl(k.ttl)).padEnd(12);
+      console.log(`    ${keyCol}  ${memCol}  ${ttlCol}  idle ${formatIdleTime(k.idleSeconds)}`);
+    }
+  }
+
+  const hasNamespaces = ks.namespaces.some(n => n.prefix !== '(no prefix)');
+  if (hasNamespaces) {
+    console.log('\n  Namespace breakdown:');
+    const labelW = Math.max(...ks.namespaces.map(n => n.prefix.length), 6);
+    console.log(`  ${'Prefix'.padEnd(labelW + 2)}  ${'Keys'.padStart(6)}  ${'Memory'.padStart(10)}  ${'% total'.padStart(7)}`);
+    for (const ns of ks.namespaces) {
+      console.log(
+        `    ${ns.prefix.padEnd(labelW)}  ${ns.keyCount.toLocaleString().padStart(6)}  ${formatBytes(ns.memoryBytes).padStart(10)}  ${ns.memoryPercent.toFixed(1).padStart(6)}%`,
+      );
+    }
+  } else {
+    console.log('\n  No namespace patterns detected.');
+  }
+
+  if (ks.warnings.length > 0) {
+    console.log('');
+    for (const w of ks.warnings) console.log(`  ! ${w}`);
+  }
   console.log('');
+}
+
+function printQueueScanSection(qs: QueueScanResult): void {
+  console.log('\n  Queue Scan\n');
+
+  if (qs.queues.length === 0) {
+    console.log('  No queues detected in Redis.');
+    console.log('');
+    return;
+  }
+
+  // Column widths
+  const nameW = Math.max(...qs.queues.map(q => q.name.length), 4);
+  const header =
+    `  ${'Name'.padEnd(nameW)}` +
+    `  ${'Waiting'.padStart(7)}` +
+    `  ${'Active'.padStart(6)}` +
+    `  ${'Completed'.padStart(9)}` +
+    `  ${'Failed'.padStart(6)}` +
+    `  ${'Delayed'.padStart(7)}` +
+    `  Stalled`;
+  console.log(header);
+  console.log('  ' + '─'.repeat(header.length - 2));
+
+  for (const q of qs.queues) {
+    console.log(
+      `  ${q.name.padEnd(nameW)}` +
+      `  ${q.waiting.toLocaleString().padStart(7)}` +
+      `  ${q.active.toLocaleString().padStart(6)}` +
+      `  ${q.completed.toLocaleString().padStart(9)}` +
+      `  ${q.failed.toLocaleString().padStart(6)}` +
+      `  ${q.delayed.toLocaleString().padStart(7)}` +
+      `  ${q.hasStalled ? 'Yes' : 'No'}`,
+    );
+  }
+
+  const allWarnings = qs.queues.flatMap(q => q.warnings);
+  if (allWarnings.length > 0) {
+    console.log('');
+    for (const w of allWarnings) console.log(`  ! ${w}`);
+  }
+  console.log('');
+}
+
+function buildQueueScanMarkdownLines(qs: QueueScanResult | null): string[] {
+  const lines: string[] = [];
+
+  lines.push('', '### Queue Scan', '');
+
+  if (qs === null) return lines; // --skip-queues: omit section body
+
+  if (qs.queues.length === 0) {
+    lines.push('No queues detected in Redis.');
+    return lines;
+  }
+
+  lines.push('| Name | Waiting | Active | Completed | Failed | Delayed | Stalled |');
+  lines.push('|------|---------|--------|-----------|--------|---------|---------|');
+  for (const q of qs.queues) {
+    lines.push(
+      `| ${q.name} | ${q.waiting.toLocaleString()} | ${q.active.toLocaleString()} | ${q.completed.toLocaleString()} | ${q.failed.toLocaleString()} | ${q.delayed.toLocaleString()} | ${q.hasStalled ? 'Yes' : 'No'} |`,
+    );
+  }
+
+  const allWarnings = qs.queues.flatMap(q => q.warnings);
+  if (allWarnings.length > 0) {
+    lines.push('');
+    for (const w of allWarnings) lines.push(`> ! ${w}`);
+  }
+
+  return lines;
 }
 
 function printAnalysisSection(
