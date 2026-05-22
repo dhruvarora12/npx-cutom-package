@@ -33,4 +33,6 @@ export interface CliOptions {
   envFile: string;
   sampleSize: number;
   idleThreshold: number;
+  failOn: 'error' | 'warn' | 'any' | undefined;  // undefined = flag not passed
+  ignore: string[];                                // not yet wired to scanner — Phase 12
 }

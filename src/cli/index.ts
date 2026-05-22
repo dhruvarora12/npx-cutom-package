@@ -14,6 +14,7 @@ import { analyzeCrossModes } from '../core/cross-mode.js';
 import type { CrossModeResult } from '../types/cross-mode.js';
 import { buildRecommendations } from '../core/recommendations.js';
 import type { RecommendationsResult } from '../types/recommendations.js';
+import { loadConfig } from '../core/config.js';
 
 const program = new Command();
 
@@ -38,40 +39,54 @@ program
   .option('--redis-url <url>', 'Redis connection URL (requires --live)')
   .option('-y, --yes', 'Skip safety countdown for CI use', false)
   .option('--env-file <path>', 'Read Redis URL from .env file (requires --live)', '.env')
-  .option('--sample-size <n>', 'Keys to sample in live mode (default: 1000)', '1000')
-  .option('--idle-threshold <days>', 'Days before a key is considered idle (default: 30)', '30')
+  .option('--sample-size <n>', 'Keys to sample in live mode (default: 1000)')
+  .option('--idle-threshold <days>', 'Days before a key is considered idle (default: 30)')
+  .addOption(
+    new Option('--fail-on <level>', 'Exit 1 when findings at or above this severity (static findings only)')
+      .choices(['error', 'warn', 'any'])
+  )
   .action(async (targetPath: string, rawOpts: Record<string, unknown>) => {
-    // --skip-cache + --skip-queues is only an error when --live is not set
-    if (rawOpts['skipCache'] === true && rawOpts['skipQueues'] === true && rawOpts['live'] !== true) {
-      console.error('Error: --skip-cache and --skip-queues together leave nothing to analyze.');
-      process.exit(1);
-    }
+    try {
+      const config = loadConfig(resolve(targetPath));
 
-    if (rawOpts['redisUrl'] !== undefined && rawOpts['live'] !== true) {
-      console.error('Error: --redis-url requires --live.');
-      process.exit(1);
-    }
+      // --skip-cache + --skip-queues is only an error when --live is not set
+      // (with --live the tool can still do live inspection even with both static analyses skipped)
+      if (rawOpts['skipCache'] === true && rawOpts['skipQueues'] === true && rawOpts['live'] !== true) {
+        console.error('Error: --skip-cache and --skip-queues together leave nothing to analyze.');
+        process.exit(2);
+      }
 
-    if (rawOpts['live'] === true && rawOpts['redisUrl'] === undefined) {
-      console.error('Error: --live requires --redis-url <url>.');
-      process.exit(1);
-    }
+      if (rawOpts['redisUrl'] !== undefined && rawOpts['live'] !== true) {
+        console.error('Error: --redis-url requires --live.');
+        process.exit(2);
+      }
 
-    const isAutoMode = rawOpts['output'] === undefined;
-    const date = new Date().toISOString().split('T')[0]!;
+      if (rawOpts['live'] === true && rawOpts['redisUrl'] === undefined && config.redisUrl === undefined) {
+        console.error('Error: --live requires --redis-url (pass --redis-url or set redisUrl in .stack-doctorrc).');
+        process.exit(2);
+      }
 
-    const options: CliOptions = {
-      output: (rawOpts['output'] as 'text' | 'json' | 'markdown') ?? 'text',
-      verbose: rawOpts['verbose'] as boolean,
-      color: rawOpts['color'] as boolean,
-      skipCache: rawOpts['skipCache'] as boolean,
-      skipQueues: rawOpts['skipQueues'] as boolean,
-      live: rawOpts['live'] as boolean,
-      redisUrl: rawOpts['redisUrl'] as string | undefined,
-      envFile: rawOpts['envFile'] as string,
-      sampleSize: parseInt(rawOpts['sampleSize'] as string, 10),
-      idleThreshold: parseInt(rawOpts['idleThreshold'] as string, 10),
-    };
+      const isAutoMode = rawOpts['output'] === undefined;
+      const date = new Date().toISOString().split('T')[0]!;
+
+      const options: CliOptions = {
+        output: (rawOpts['output'] as 'text' | 'json' | 'markdown') ?? config.output ?? 'text',
+        verbose: rawOpts['verbose'] as boolean,
+        color: rawOpts['color'] as boolean,
+        skipCache: (rawOpts['skipCache'] as boolean) || (config.skipCache ?? false),
+        skipQueues: (rawOpts['skipQueues'] as boolean) || (config.skipQueues ?? false),
+        live: rawOpts['live'] as boolean,
+        redisUrl: (rawOpts['redisUrl'] as string | undefined) ?? config.redisUrl,
+        envFile: rawOpts['envFile'] as string,
+        sampleSize: rawOpts['sampleSize'] !== undefined
+          ? parseInt(rawOpts['sampleSize'] as string, 10)
+          : (config.sampleSize ?? 1000),
+        idleThreshold: rawOpts['idleThreshold'] !== undefined
+          ? parseInt(rawOpts['idleThreshold'] as string, 10)
+          : (config.idleThreshold ?? 30),
+        failOn: (rawOpts['failOn'] as 'error' | 'warn' | 'any' | undefined) ?? config.failOn,
+        ignore: config.ignore ?? [],
+      };
 
     if (options.verbose) {
       console.log(`Scanning: ${targetPath}`);
@@ -129,7 +144,7 @@ program
       } catch (err) {
         console.error(`\nError: Could not connect to Redis at ${options.redisUrl!}`);
         console.error(err instanceof Error ? err.message : String(err));
-        process.exit(1);
+        process.exit(2);
       }
 
       // Clear progress line after scan completes
@@ -155,17 +170,32 @@ program
       crossModeResult,
     );
 
-    if (isAutoMode) {
-      const filename = `stack-doctor-report-${date}.md`;
-      const filepath = join(resolve(targetPath), filename);
-      const md = buildMarkdownReport(result, scanResult, cacheResult, queueResult, liveResult, crossModeResult, recommendationsResult, summary, options, date);
-      await writeFile(filepath, md, 'utf-8');
-      const rel = './' + relative(process.cwd(), filepath).replace(/\\/g, '/');
-      console.log(`Report saved to ${rel}`);
-      return;
-    }
+      if (isAutoMode) {
+        const filename = `stack-doctor-report-${date}.md`;
+        const filepath = join(resolve(targetPath), filename);
+        const md = buildMarkdownReport(result, scanResult, cacheResult, queueResult, liveResult, crossModeResult, recommendationsResult, summary, options, date);
+        await writeFile(filepath, md, 'utf-8');
+        const rel = './' + relative(process.cwd(), filepath).replace(/\\/g, '/');
+        console.log(`Report saved to ${rel}`);
+      } else {
+        printReport(result, scanResult, cacheResult, queueResult, liveResult, crossModeResult, recommendationsResult, summary, options, date);
+      }
 
-    printReport(result, scanResult, cacheResult, queueResult, liveResult, crossModeResult, recommendationsResult, summary, options, date);
+      // ── Exit code (--fail-on, static findings only) ─────────────────────
+      const exitCode = computeExitCode(options.failOn, cacheResult, queueResult);
+      if (exitCode !== 0) {
+        const count = countFailingFindings(options.failOn!, cacheResult, queueResult);
+        const isJsonOutput = !isAutoMode && options.output === 'json';
+        if (!isJsonOutput) {
+          console.log(`\nstack-doctor: exiting with code 1 — ${count} finding(s) at or above '${options.failOn!}' level`);
+        }
+        process.exit(1);
+      }
+
+    } catch (err) {
+      console.error(`stack-doctor: unexpected error — ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(2);
+    }
   });
 
 program.parse();
@@ -540,6 +570,38 @@ function buildKeyScanMarkdownLines(
   }
 
   return lines;
+}
+
+// ── Exit code helpers ─────────────────────────────────────────────────────────
+
+function computeExitCode(
+  failOn: 'error' | 'warn' | 'any' | undefined,
+  cacheResult: CacheAnalysisResult | null,
+  queueResult: QueueAnalysisResult | null,
+): number {
+  if (failOn === undefined) return 0;
+  const staticFindings = [
+    ...(cacheResult?.findings ?? []),
+    ...(queueResult?.findings ?? []),
+  ];
+  if (failOn === 'any')  return staticFindings.length > 0 ? 1 : 0;
+  if (failOn === 'warn') return staticFindings.some(f => f.severity === 'error' || f.severity === 'warn') ? 1 : 0;
+  // failOn === 'error'
+  return staticFindings.some(f => f.severity === 'error') ? 1 : 0;
+}
+
+function countFailingFindings(
+  failOn: 'error' | 'warn' | 'any',
+  cacheResult: CacheAnalysisResult | null,
+  queueResult: QueueAnalysisResult | null,
+): number {
+  const staticFindings = [
+    ...(cacheResult?.findings ?? []),
+    ...(queueResult?.findings ?? []),
+  ];
+  if (failOn === 'any')  return staticFindings.length;
+  if (failOn === 'warn') return staticFindings.filter(f => f.severity === 'error' || f.severity === 'warn').length;
+  return staticFindings.filter(f => f.severity === 'error').length;
 }
 
 // ── Text / JSON / explicit markdown output ────────────────────────────────────
