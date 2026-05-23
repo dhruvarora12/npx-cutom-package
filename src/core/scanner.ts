@@ -2,7 +2,7 @@ import {
   SCAN_FILE_COUNT_HARD_LIMIT,
   SCAN_FILE_COUNT_WARNING,
 } from '../config/constants.js';
-import type { ScannedFile, SkippedFile, ScanResult } from '../types/scan.js';
+import type { ScannedFile, SkippedFile, ScanResult, ScanOptions } from '../types/scan.js';
 import type { File } from '@babel/types';
 import { walkSourceFiles } from './walker.js';
 import { parseFile } from './parser.js';
@@ -11,11 +11,12 @@ import { mapImports } from './mapper.js';
 export async function scanFiles(
   targetPath: string,
   libraries: string[],
+  options: ScanOptions = {},
 ): Promise<ScanResult> {
   const start = Date.now();
   const libSet = new Set(libraries);
 
-  const { paths, hitWarning, hitHardLimit } = await walkSourceFiles(targetPath);
+  const { paths, hitWarning, hitHardLimit } = await walkSourceFiles(targetPath, options.ignore);
 
   if (hitWarning && !hitHardLimit) {
     process.stderr.write(
@@ -40,6 +41,7 @@ export async function scanFiles(
     }
 
     allParsedCount++;
+    options.onProgress?.(allParsedCount);
     const imports = mapImports(outcome.ast, libSet);
     if (imports.length > 0) {
       files.push({ path: filePath, source: outcome.source, imports, ast: outcome.ast });

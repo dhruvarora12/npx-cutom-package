@@ -64,8 +64,8 @@ async function inspectBatch(
   const pipeline = client.pipeline();
   for (const key of batch) {
     pipeline.ttl(key);
-    pipeline.object('idletime', key);
-    pipeline.memory('usage', key);
+    pipeline.object('IDLETIME', key);
+    pipeline.memory('USAGE', key);
   }
 
   const results = await pipeline.exec();

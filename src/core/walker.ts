@@ -15,8 +15,11 @@ export interface WalkerResult {
   hitHardLimit: boolean;
 }
 
-export async function walkSourceFiles(targetPath: string): Promise<WalkerResult> {
-  const ig = await loadGitignore(targetPath);
+export async function walkSourceFiles(
+  targetPath: string,
+  ignorePatterns?: string[],
+): Promise<WalkerResult> {
+  const ig = await buildIgnore(targetPath, ignorePatterns);
   const ignoreDirSet = new Set(SCAN_IGNORE_DIRS);
 
   const paths: string[] = await (new fdir()
@@ -43,11 +46,27 @@ export async function walkSourceFiles(targetPath: string): Promise<WalkerResult>
   };
 }
 
-async function loadGitignore(targetPath: string): Promise<Ignore | null> {
+async function buildIgnore(
+  targetPath: string,
+  ignorePatterns: string[] | undefined,
+): Promise<Ignore | null> {
+  const hasUserPatterns = ignorePatterns !== undefined && ignorePatterns.length > 0;
+
+  let ig: Ignore | null = null;
   try {
     const content = await readFile(join(targetPath, '.gitignore'), 'utf-8');
-    return ignore().add(content);
+    ig = ignore().add(content);
   } catch {
-    return null;
+    // no .gitignore — ig stays null
   }
+
+  if (hasUserPatterns) {
+    if (ig !== null) {
+      ig.add(ignorePatterns!);            // append to existing .gitignore instance
+    } else {
+      ig = ignore().add(ignorePatterns!); // fresh instance — no .gitignore found
+    }
+  }
+
+  return ig;
 }

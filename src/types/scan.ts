@@ -44,3 +44,8 @@ export interface ScanResult {
   skipped: SkippedFile[];
   stats: ScanStats;
 }
+
+export interface ScanOptions {
+  ignore?: string[];
+  onProgress?: (scanned: number) => void;
+}

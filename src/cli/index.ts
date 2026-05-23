@@ -15,13 +15,14 @@ import type { CrossModeResult } from '../types/cross-mode.js';
 import { buildRecommendations } from '../core/recommendations.js';
 import type { RecommendationsResult } from '../types/recommendations.js';
 import { loadConfig } from '../core/config.js';
+import chalk from 'chalk';
 
 const program = new Command();
 
 program
   .name('stack-doctor')
   .description('Static + live analysis of Redis caching and queuing in Node.js backends.')
-  .version('0.1.0')
+  .version('1.0.0')
   .argument('[path]', 'Target project directory', process.cwd())
   .addOption(
     new Option(
@@ -116,7 +117,18 @@ program
       })
       .map(c => c.name);
 
-    const scanResult = await scanFiles(targetPath, libNames);
+    const showScanProgress = isAutoMode || options.output === 'text';
+    if (showScanProgress) process.stdout.write('Scanning files... 0');
+
+    const scanOpts: import('../types/scan.js').ScanOptions = { ignore: options.ignore };
+    if (showScanProgress) {
+      scanOpts.onProgress = (scanned) => { process.stdout.write(`\rScanning files... ${scanned}`); };
+    }
+    const scanResult = await scanFiles(targetPath, libNames, scanOpts);
+
+    if (showScanProgress) {
+      process.stdout.write('\r' + ' '.repeat(30) + '\r');
+    }
     const cacheResult = options.skipCache ? null : analyzeCache(scanResult);
     const queueResult = options.skipQueues ? null : analyzeQueue(scanResult);
     const summary = buildReportSummary(cacheResult, queueResult);
@@ -131,16 +143,17 @@ program
       const showProgress = options.output !== 'json' && options.output !== 'markdown';
 
       try {
-        liveResult = await analyzeLive(options.redisUrl!, {
+        const liveOpts = {
           sampleSize: options.sampleSize,
           idleThresholdDays: options.idleThreshold,
           skipQueues: options.skipQueues,
-          onProgress: showProgress
-            ? (scanned, total) => {
-                process.stdout.write(`\rScanning keys... ${scanned}/${total}`);
-              }
-            : undefined,
-        });
+          ...(showProgress ? {
+            onProgress: (scanned: number, total: number) => {
+              process.stdout.write(`\rScanning keys... ${scanned}/${total}`);
+            },
+          } : {}),
+        };
+        liveResult = await analyzeLive(options.redisUrl!, liveOpts);
       } catch (err) {
         console.error(`\nError: Could not connect to Redis at ${options.redisUrl!}`);
         console.error(err instanceof Error ? err.message : String(err));
@@ -240,6 +253,12 @@ interface ReportSummary {
 
 // ── Grade ─────────────────────────────────────────────────────────────────────
 
+function colorGrade(grade: Grade): string {
+  if (grade === 'A' || grade === 'B') return chalk.green.bold(grade);
+  if (grade === 'C') return chalk.yellow.bold(grade);
+  return chalk.red.bold(grade); // D or F
+}
+
 function computeGrade(errors: number, warnings: number): Grade {
   if (errors >= 6) return 'F';
   if (errors >= 3) return 'D';
@@ -297,8 +316,9 @@ function buildReportSummary(
   return { errors, warnings, filesAffected, totalFindings: allFindings.length };
 }
 
-function formatGradeLine(summary: ReportSummary): string {
+function formatGradeLine(summary: ReportSummary, colored = false): string {
   const grade = computeGrade(summary.errors, summary.warnings);
+  const gradeLabel = colored ? colorGrade(grade) : grade;
   const parts: string[] = [];
   if (summary.errors > 0) parts.push(`${summary.errors} error${summary.errors > 1 ? 's' : ''}`);
   if (summary.warnings > 0) parts.push(`${summary.warnings} warning${summary.warnings > 1 ? 's' : ''}`);
@@ -306,7 +326,7 @@ function formatGradeLine(summary: ReportSummary): string {
     parts.push(`${summary.filesAffected} ${summary.filesAffected === 1 ? 'file' : 'files'} affected`);
   }
   const detail = parts.length > 0 ? `   ${parts.join(' · ')}` : '';
-  return `Grade: ${grade}${detail}`;
+  return `Grade: ${gradeLabel}${detail}`;
 }
 
 // ── Live section formatting helpers ──────────────────────────────────────────
@@ -692,8 +712,9 @@ function printReport(
   }
 
   // ── Text ──────────────────────────────────────────────────────────────────
+  if (!options.color) chalk.level = 0;
   console.log('\nStack Doctor — Static Analysis\n');
-  console.log(formatGradeLine(summary));
+  console.log(formatGradeLine(summary, true));
   printActionPlanSection(recommendationsResult);
   console.log(`\nScanned: ${result.packageJsonPath ?? 'unknown'}\n`);
 
@@ -985,7 +1006,7 @@ function printActionPlanSection(rec: RecommendationsResult): void {
 
   // ⚡ Quick Wins sub-section
   if (rec.quickWins.length > 0) {
-    console.log('  ⚡ Quick Wins\n');
+    console.log(`  ${chalk.cyan.bold('⚡ Quick Wins')}\n`);
     for (const r of rec.quickWins) {
       const liveTag = r.confirmedByLive ? '  (confirmed by live data)' : '';
       console.log(`  ${r.title}${liveTag}`);
@@ -996,16 +1017,16 @@ function printActionPlanSection(rec: RecommendationsResult): void {
   }
 
   // Priority groups
-  const groups: Array<{ label: string; priority: 1 | 2 | 3 }> = [
-    { label: 'Priority 1 — Fix Now',  priority: 1 },
-    { label: 'Priority 2 — Fix Soon', priority: 2 },
-    { label: 'Priority 3 — Consider', priority: 3 },
+  const groups: Array<{ label: string; priority: 1 | 2 | 3; labelColor: (s: string) => string }> = [
+    { label: 'Priority 1 — Fix Now',  priority: 1, labelColor: (s) => chalk.red(s) },
+    { label: 'Priority 2 — Fix Soon', priority: 2, labelColor: (s) => chalk.yellow(s) },
+    { label: 'Priority 3 — Consider', priority: 3, labelColor: (s) => s },
   ];
 
-  for (const { label, priority } of groups) {
+  for (const { label, priority, labelColor } of groups) {
     const items = rec.recommendations.filter((r) => r.priority === priority);
     if (items.length === 0) continue;
-    console.log(`  ${label}\n`);
+    console.log(`  ${labelColor(label)}\n`);
     for (const r of items) {
       const liveTag = r.confirmedByLive ? '  [confirmed by live data]' : '';
       console.log(`  [${r.effort.toUpperCase()}]  ${r.title}${liveTag}`);
@@ -1063,7 +1084,7 @@ function printAnalysisSection(
   disclaimer: string,
   advisories?: string[],
 ): void {
-  console.log(`\n${title}`);
+  console.log(`\n${chalk.bold(title)}`);
   if (advisories !== undefined && advisories.length > 0) {
     for (const a of advisories) console.log(`  ! ${a}`);
   }
@@ -1076,7 +1097,11 @@ function printAnalysisSection(
 }
 
 function printFinding(f: Finding): void {
-  const sevLabel = f.severity === 'error' ? 'ERROR' : f.severity === 'warn' ? 'WARN ' : 'INFO ';
+  const sevLabel = f.severity === 'error'
+    ? chalk.red.bold('ERROR')
+    : f.severity === 'warn'
+    ? chalk.yellow('WARN ')
+    : chalk.dim('INFO ');
   console.log(`    ${sevLabel}  ${f.rule.padEnd(28)}  ${f.file}:${f.line}`);
   if (f.codeSnippet) console.log(`      ${f.codeSnippet}`);
   console.log(`      ${f.message}`);
