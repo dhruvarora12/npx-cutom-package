@@ -6,6 +6,8 @@
 [![license](https://img.shields.io/npm/l/stack-doctor)](LICENSE)
 [![node](https://img.shields.io/node/v/stack-doctor)](package.json)
 
+
+https://www.npmjs.com/package/stack-doctor
 ## What it does
 
 stack-doctor scans your Node.js backend and produces a health report for your Redis setup — what caching and queuing libraries you use, what's misconfigured, and what's happening in your live Redis instance right now.
